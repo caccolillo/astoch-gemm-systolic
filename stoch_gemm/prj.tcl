@@ -313,15 +313,15 @@ make_wrapper -files $bd_file -top -import
 # The generated wrapper is automatically added to sources_1 by -import.
 # Set it as the synthesis top.
 set wrapper_file [get_files -of_objects [get_filesets sources_1] \
-                  {*gemm_accel_wrapper*}]
+                  {*mpsoc_preset_wrapper*}]
 if { $wrapper_file ne "" } {
-    set_property top gemm_accel_wrapper [current_fileset]
+    set_property top mpsoc_preset_wrapper [current_fileset]
     puts " Set synthesis top: gemm_accel_wrapper"
 } else {
     puts "WARNING: wrapper not found -- set top manually:"
-    puts "  set_property top gemm_accel_wrapper \[current_fileset\]"
+    puts "  set_property top mpsoc_preset_wrapper \[current_fileset\]"
 }
-update_compile_order -fileset sources_1
+
 
 # =============================================================================
 # Launch Synthesis
