@@ -33,7 +33,7 @@ entity stoch_gemm_axis_wrapper is
         N                   : integer := 8;
         WIDTH               : integer := 16;
         LFSR_W              : integer := 16;
-        STREAM_LEN          : integer := 1024;
+        STREAM_LEN          : integer := 1024*8;
         KW                  : integer := 16;
         KBUF_MAX            : integer := 64;
         C_S_AXI_ADDR_WIDTH  : integer := 12;
