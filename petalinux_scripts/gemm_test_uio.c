@@ -87,7 +87,9 @@ static inline uint32_t rd(volatile uint32_t *b,uint32_t o){return b[o/4];}
 // This is consistent with the testbench and Python reference scripts.
 static uint16_t enc(double x){
     int q=(int)round((x+1.0)/2.0*65536.0);
-    if(q<0)q=0; if(q>0xFFFF)q=0xFFFF; return(uint16_t)q;
+    if(q<0) q=0;
+    if(q>0xFFFF) q=0xFFFF;
+    return (uint16_t)q;
 }
 
 // ---- im2col ----------------------------------------------------------------
@@ -162,7 +164,7 @@ static int dma_poll(volatile uint32_t *dma,uint32_t sr_off,const char *nm){
 
 // ============================================================================
 int main(void){
-    printf("=== Stochastic GEMM test (UIO + /dev/mem) ===\n\n");
+    printf("=== Stochastic GEMM test v6 (UIO + /dev/mem) ===\n\n");
 
     // ---- Open /dev/mem ----
     int memfd=open("/dev/mem",O_RDWR|O_SYNC);
@@ -243,17 +245,25 @@ int main(void){
     int rx_bytes=N*N*4;
     volatile uint32_t *tx32=(volatile uint32_t *)tx;
     memset((void*)rx,0,rx_bytes);
+    // Per testbench (tb_stoch_image.sv):
+    //   a_bin = kernel tap k broadcast to all N rows
+    //   b_bin = image patches for N output pixels (columns)
+    // So: a[i] = kenc[k] for all i, b[i] = patches[pixel_i][tap_k]
     for(int k=0;k<K;k++) for(int i=0;i<N;i++){
-        tx32[k*2*N+i]  =patches[k*H*W+tile_base+i];
-        tx32[k*2*N+N+i]=kenc[k];
+        tx32[k*2*N+i]   = kenc[k];                        // a: kernel broadcast
+        tx32[k*2*N+N+i] = patches[k*H*W+tile_base+i];    // b: pixel patches
     }
     // Flush TX buffer to DDR -- DMA reads directly from DDR bypassing cache
     __sync_synchronize();
     msync((void*)tx, BUF_SIZE, MS_SYNC);
 
     // Verify TX was written correctly -- print first non-zero tap
-    printf("TX[k=5,i=0..3]: 0x%04X 0x%04X 0x%04X 0x%04X\n",
+    // a[k=5,i=0..3] = kenc[5] broadcast (all same)
+    // b[k=5,i=0..3] = patches for pixels 0..3 at tap k=5
+    printf("TX a[k=5,i=0..3]: 0x%04X 0x%04X 0x%04X 0x%04X  (kernel, all same)\n",
            tx32[5*2*N+0], tx32[5*2*N+1], tx32[5*2*N+2], tx32[5*2*N+3]);
+    printf("TX b[k=5,i=0..3]: 0x%04X 0x%04X 0x%04X 0x%04X  (patches, should vary)\n",
+           tx32[5*2*N+N+0], tx32[5*2*N+N+1], tx32[5*2*N+N+2], tx32[5*2*N+N+3]);
 
     printf("TX: %d beats (%d bytes) @ 0x%08lX\n",
            n_beats,tx_bytes,(unsigned long)TX_BUF_PHYS);
@@ -349,14 +359,15 @@ int main(void){
     (void)hw_resw;
     // RTL decode (from stoch_gemm_top.sv):
     //   c_flat = 2*cnt - K*STREAM_LEN  (signed, de-biased by hardware)
-    //   real_value = c_flat / STREAM_LEN  in range [-K, +K]
-    //   conv_out = real_value * 255 * kmax / kern_sum
-    // where kern_sum = sum of kernel taps = 16, kmax = 4.
+    //   real_value = c_flat / hw_stream_len
+    //   conv_out   = real_value * 255 * kmax / kern_sum
+    // Use hw_stream_len from INFO2 register -- not the compile-time #define.
+    int hw_stream_len = (int)info2;  // actual STREAM_LEN synthesised in hardware
     double kern_sum = 0.0;
     for(int k=0;k<K;k++) kern_sum += kern[k];  // = 16
     double hw_conv_scale = 255.0 * kmax / kern_sum;
-    printf("HW decode: c_flat/STREAM_LEN * %.4f  (kmax=%.1f kern_sum=%.1f)\n\n",
-           hw_conv_scale, kmax, kern_sum);
+    printf("HW decode: c_flat/%d * %.4f  (kmax=%.1f kern_sum=%.1f)\n\n",
+           hw_stream_len, hw_conv_scale, kmax, kern_sum);
 
     // Open a fresh file descriptor and mmap for the RX buffer to guarantee
     // we are not reading stale cache -- DMA writes bypass CPU cache.
@@ -366,24 +377,28 @@ int main(void){
     if((void*)rx32 == MAP_FAILED){ perror("mmap rx32"); return 1; }
 
     // Print raw values for debug
-    printf("Raw RX[0..7]: ");
+    // Per testbench: kernel broadcast to all rows, patches on columns.
+    // c[row][col] = conv(pixel_col) for all rows (all rows identical).
+    // So pixel p is at c[0][p] = RX[0*N + p] = RX[p].
+    // RX[0..7] ARE the 8 output pixels.
+    printf("Raw RX[0..7] (pixels 0..7): ");
     for(int i=0;i<8;i++) printf("0x%08X ", (uint32_t)rx32[i]);
     printf("\n\n");
+
     double sw[64];
-    double kern_sum=0; for(int i=0;i<K;i++) kern_sum+=kern[i]; // =16
-    conv_sw(img,H,W,kern,kern_sum,sw);  // sw values in [0,255]
+    conv_sw(img,H,W,kern,kern_sum,sw);  // kern_sum already computed above
 
     printf("%-5s  %-10s  %-10s  %-10s\n","pixel","hw_val","sw_val","err_8bit");
     printf("-----  ----------  ----------  ----------\n");
     double mse=0;
     for(int i=0;i<N;i++){
-        // c_flat is signed RESW-bit; sign-extend from RESW bits
+        // Read c[0][i] = RX[i] -- pixel i is at row 0, column i
         int32_t c_flat = (int32_t)rx32[i];
         // Sign extend if RESW < 32
         int hw_resw2 = (info >> 24) & 0xFF;
         if(hw_resw2 < 32 && (c_flat & (1 << (hw_resw2-1))))
             c_flat |= ~((1 << hw_resw2) - 1);
-        double hw_pix = ((double)c_flat / STREAM_LEN) * hw_conv_scale;
+        double hw_pix = ((double)c_flat / hw_stream_len) * hw_conv_scale;
         double sw_pix=sw[tile_base+i];
         double err=fabs(hw_pix-sw_pix);
         mse+=err*err;
