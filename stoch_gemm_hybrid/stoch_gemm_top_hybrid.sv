@@ -59,6 +59,7 @@ module stoch_gemm_top_hybrid #(
     // Control
     input  logic                          core_start,
     input  logic [$clog2(KMAX+1)-1:0]     k_len,            // 1..KMAX
+    input  logic [31:0]                   res_per_k,        // SLR/K written by SW
     output logic                          core_busy,
     output logic                          core_done,
 
@@ -128,11 +129,10 @@ module stoch_gemm_top_hybrid #(
 
     // Per-term residue window length (split STREAM_LEN_RESIDUE across K terms).
     // For K=9 and STREAM_LEN_RESIDUE=65536: ~7281 cycles per term.
-    logic [31:0] res_per_k;
-    always_comb begin
-        // Integer divide: round up so total >= STREAM_LEN_RESIDUE.
-        res_per_k = (STREAM_LEN_RESIDUE + k_len - 1) / k_len;
-    end
+    // res_per_k is now driven by an AXI register written by software.
+    // This removes the runtime divider that was blocking timing closure
+    // (32-deep CARRY8 chain) and shifts the SLR/K computation to userspace,
+    // which only does it once at startup.
 
     // Default signal assignments each cycle
     always_comb begin

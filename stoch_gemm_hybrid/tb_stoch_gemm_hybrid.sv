@@ -44,6 +44,10 @@ module tb_stoch_gemm_hybrid;
     logic                          core_done;
     logic [$clog2(64)-1:0]         core_kidx;
     logic                          core_load_k;
+    // res_per_k is now an input to the top (was internally computed)
+    // Compute it here: ceil(STREAM_LEN_RESIDUE / K)
+    localparam int RES_PER_K_VAL =
+        (STREAM_LEN_RESIDUE + K - 1) / K;
     logic [N*WIDTH-1:0]            core_a_bin;
     logic [N*WIDTH-1:0]            core_b_bin;
     logic signed [N*N*RESW-1:0]    core_c_flat;
@@ -63,6 +67,7 @@ module tb_stoch_gemm_hybrid;
         .rst_n      (rst_n),
         .core_start (core_start),
         .k_len      (k_len),
+        .res_per_k  (32'd0 | RES_PER_K_VAL),
         .core_busy  (core_busy),
         .core_done  (core_done),
         .core_kidx  (core_kidx),

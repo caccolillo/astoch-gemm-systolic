@@ -27,7 +27,7 @@ use ieee.numeric_std.all;
 
 entity stoch_gemm_axis_wrapper_hybrid is
     generic (
-        N                   : integer := 8;
+        N                   : integer := 10;
         WIDTH               : integer := 16;
         LFSR_W              : integer := 16;
         STREAM_LEN          : integer := 8192;     -- ignored in hybrid mode

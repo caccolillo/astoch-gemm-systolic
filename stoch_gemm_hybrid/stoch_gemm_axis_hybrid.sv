@@ -103,6 +103,7 @@ module stoch_gemm_axis_hybrid #(
     logic [4:0] aw_addr_q, ar_addr_q;
 
     logic [KW-1:0]  reg_klen;
+    logic [31:0]    reg_res_per_k;     // res_per_k written by software
     logic           reg_irqen;
     logic           core_start;
     logic           core_busy, core_done;
@@ -137,6 +138,7 @@ module stoch_gemm_axis_hybrid #(
             s_axi_bresp    <= 2'b00;
             aw_addr_q      <= '0;
             reg_klen       <= '0;
+            reg_res_per_k  <= 32'd8192;   // safe default for K=9, SLR=65536
             reg_irqen      <= 1'b0;
             core_start     <= 1'b0;
         end else begin
@@ -161,6 +163,7 @@ module stoch_gemm_axis_hybrid #(
                                 reg_irqen <= s_axi_wdata[1];
                             end
                             5'h08: reg_klen <= s_axi_wdata[KW-1:0];
+                            5'h20: reg_res_per_k <= s_axi_wdata[31:0];
                             default: ;
                         endcase
                         s_axi_wready <= 1'b0;
@@ -227,6 +230,7 @@ module stoch_gemm_axis_hybrid #(
             5'h14: s_axi_rdata = reg_icount;                              // ICOUNT
             5'h18: s_axi_rdata = reg_ocount;                              // OCOUNT
             5'h1C: s_axi_rdata = {16'd0, SAR_BIT_LEN[7:0], K_SAR_BITS[7:0]}; // INFO3
+            5'h20: s_axi_rdata = reg_res_per_k;                           // RES_PER_K
             default: s_axi_rdata = 32'd0;
         endcase
     end
@@ -300,6 +304,7 @@ module stoch_gemm_axis_hybrid #(
         .rst_n       (aresetn),
         .core_start  (core_start),
         .k_len       (reg_klen),
+        .res_per_k   (reg_res_per_k),
         .core_busy   (core_busy),
         .core_done   (core_done),
         .core_kidx   (core_kidx),
