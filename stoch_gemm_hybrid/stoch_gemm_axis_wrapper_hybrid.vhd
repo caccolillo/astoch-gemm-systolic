@@ -27,7 +27,19 @@ use ieee.numeric_std.all;
 
 entity stoch_gemm_axis_wrapper_hybrid is
     generic (
-        N                   : integer := 10;
+        -- The defaults below are the SINGLE SOURCE OF TRUTH for the
+        -- array sizing. Do NOT override them via BD set_property
+        -- CONFIG.<name> in the Tcl flow -- that path triggers Vivado
+        -- BD revalidation, which cascades into PS settings (pl_clk0,
+        -- MIO config, DDR) and produces unbootable images. Edit these
+        -- numbers here directly when you want to retarget.
+        --
+        -- Resource guidance (Avnet Ultra96-V2 / ZU3EG, 70k LUTs):
+        --   N =  8   ~13.5k LUTs (19%)   -- fits comfortably
+        --   N = 10   ~50k   LUTs (98%)   -- placement FAILS (no CLBs)
+        --   N = 16+                       -- requires ZU7EV or larger
+        --   N = 22   ~250k  LUTs          -- requires ZU9EG+
+        N                   : integer := 22;
         WIDTH               : integer := 16;
         LFSR_W              : integer := 16;
         STREAM_LEN          : integer := 8192;     -- ignored in hybrid mode

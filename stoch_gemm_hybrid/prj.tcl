@@ -30,9 +30,13 @@
 # Usage:
 #   vivado -mode batch -source prj_gemm_hybrid_axi.tcl
 #       -> full flow: project -> synth -> impl -> bitstream -> XSA + reports
-#       -> DEFAULT N_GEMM = 10 (10x10 array, 100 PEs)
-#   vivado -mode batch -source prj_gemm_hybrid_axi.tcl -tclargs --N 8
-#       -> override N to 8 for an 8x8 array (still goes through every phase)
+#
+# Array sizing is NOT a command-line argument. The current values come
+# from VHDL generic defaults in stoch_gemm_axis_wrapper_hybrid.vhd:
+#   N = 22, K_SAR_BITS = 8, SAR_BIT_LEN = 32,
+#   STREAM_LEN_RESIDUE = 65536, KBUF_MAX = 64
+#
+# To retarget, edit the VHDL file and re-run this script.
 # =============================================================================
 
 # ---- Defaults --------------------------------------------------------------
@@ -43,27 +47,32 @@ set proj_dir   [file join $origin_dir $proj_name]
 set part       xczu3eg-sbva484-1-i
 set board_part {avnet.com:ultra96v2:part0:1.2}
 
-# GEMM array sizing - default 22x22
+# GEMM array sizing - these mirror the VHDL generic defaults in
+# stoch_gemm_axis_wrapper_hybrid.vhd. They are NOT used to override the
+# BD here (that path corrupts the PS config and breaks boot). Update both
+# the VHDL file AND these comment-values together when retargeting.
+#
+# Current setting: 22x22 (484 PEs) -- requires ZU9EG or larger.
+# To target ZU3EG (Ultra96-V2), set N=8 in the VHDL wrapper.
 set N_GEMM     22
 set K_SAR_BITS 8
 set SAR_BIT_LEN 32
 set STREAM_LEN_RESIDUE 65536
 set KBUF_MAX   64
 
-# Flow runs all phases unconditionally. Tuning is via --N / --K_SAR_BITS etc.
+# Flow runs all phases unconditionally. Only project / part / src_dir
+# can be overridden at the command line; ARRAY SIZING IS NOT OVERRIDABLE
+# from the Tcl any more -- edit stoch_gemm_axis_wrapper_hybrid.vhd to
+# change N, K_SAR_BITS, SAR_BIT_LEN, STREAM_LEN_RESIDUE, KBUF_MAX.
 if {[info exists ::argv]} {
     for {set i 0} {$i < [llength $::argv]} {incr i} {
         set arg [lindex $::argv $i]
         switch -- $arg {
-            --src_dir            { incr i; set src_dir   [lindex $::argv $i] }
-            --proj               { incr i; set proj_name [lindex $::argv $i] }
-            --part               { incr i; set part      [lindex $::argv $i] }
-            --board_part         { incr i; set board_part [lindex $::argv $i] }
-            --N                  { incr i; set N_GEMM     [lindex $::argv $i] }
-            --K_SAR_BITS         { incr i; set K_SAR_BITS [lindex $::argv $i] }
-            --SAR_BIT_LEN        { incr i; set SAR_BIT_LEN [lindex $::argv $i] }
-            --STREAM_LEN_RESIDUE { incr i; set STREAM_LEN_RESIDUE [lindex $::argv $i] }
-            default              {}
+            --src_dir    { incr i; set src_dir   [lindex $::argv $i] }
+            --proj       { incr i; set proj_name [lindex $::argv $i] }
+            --part       { incr i; set part      [lindex $::argv $i] }
+            --board_part { incr i; set board_part [lindex $::argv $i] }
+            default      {}
         }
     }
 }
@@ -236,40 +245,41 @@ if {$current_bd ne ""} {
 puts "INFO: detected [llength $bd_designs] BD design(s); using '$bd_design'"
 
 # ===========================================================================
-# PHASE 5b -- Override GEMM generics on the BD cell
-# This is how we change the array size from 8x8 to N_GEMM x N_GEMM without
-# editing source files. The wrapper exposes N, K_SAR_BITS, SAR_BIT_LEN and
-# STREAM_LEN_RESIDUE as VHDL generics; Vivado surfaces these as CONFIG.*
-# properties on the BD cell.
+# PHASE 5b -- Sanity-check the PS configuration (READ ONLY)
+#
+# Important: we DO NOT use set_property to override the GEMM cell's
+# generics here, even though Vivado nominally allows it. Doing so triggers
+# Vivado BD revalidation, which has been observed to silently change PS
+# settings (pl_clk0 jumping to 250 MHz, MIO reassignment, DDR retiming).
+# Those changes cascade into FSBL PSU init code that hangs at boot before
+# any UART output.
+#
+# Instead, the array sizing (N, K_SAR_BITS, SAR_BIT_LEN, STREAM_LEN_RESIDUE,
+# KBUF_MAX) lives as VHDL generics in stoch_gemm_axis_wrapper_hybrid.vhd.
+# Edit those defaults to retarget; do NOT touch the BD's CONFIG.* here.
+#
+# This phase just READS the PS clock setting and warns if it has drifted
+# away from the expected 99.99 MHz.
 # ===========================================================================
-puts "\n==> PHASE 5b: overriding GEMM cell generics"
+puts "\n==> PHASE 5b: verifying PS clock configuration"
 
-# The cell is named stoch_gemm_axis_wrap_0 in the original bd.tcl
-set gemm_cell [get_bd_cells -quiet stoch_gemm_axis_wrap_0]
-if {[llength $gemm_cell] == 0} {
-    # Fallback: search by VLNV
-    set gemm_cell [get_bd_cells -quiet -filter "VLNV =~ *stoch_gemm_axis_wrapper_hybrid*"]
-}
-if {[llength $gemm_cell] == 0} {
-    puts "WARN: GEMM cell not found in BD by name 'stoch_gemm_axis_wrap_0'"
-    puts "       (continuing with default generics from the VHDL entity)"
+set ps_cell [get_bd_cells -quiet -filter "VLNV =~ *zynq_ultra_ps_e*"]
+if {[llength $ps_cell] == 0} {
+    puts "WARN: ZynqMP PS cell not found in BD"
 } else {
-    puts "INFO: found GEMM cell: $gemm_cell"
-    if {[catch {
-        set_property -dict [list \
-            CONFIG.N                  $N_GEMM \
-            CONFIG.K_SAR_BITS         $K_SAR_BITS \
-            CONFIG.SAR_BIT_LEN        $SAR_BIT_LEN \
-            CONFIG.STREAM_LEN_RESIDUE $STREAM_LEN_RESIDUE \
-        ] $gemm_cell
-    } gen_err]} {
-        puts "WARN: could not set all generics: $gen_err"
-        puts "       (continuing -- some defaults may apply)"
-    } else {
-        puts "INFO: GEMM generics set: N=$N_GEMM, K_SAR_BITS=$K_SAR_BITS,"
-        puts "       SAR_BIT_LEN=$SAR_BIT_LEN, STREAM_LEN_RESIDUE=$STREAM_LEN_RESIDUE"
+    set current_pl_clk [get_property CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $ps_cell]
+    puts "INFO: PS cell '$ps_cell' has pl_clk0 = $current_pl_clk MHz"
+    if {abs($current_pl_clk - 99.999001) > 1.0} {
+        puts "ERROR: pl_clk0 = $current_pl_clk MHz, expected ~99.99 MHz."
+        puts "        The BD's PS configuration has drifted from the original."
+        puts "        Open the BD in GUI, fix the PS PL Fabric Clock to 99.999,"
+        puts "        re-save the BD, and re-run this script."
+        exit 1
     }
 }
+
+puts "INFO: Array sizing comes from VHDL generics in"
+puts "      stoch_gemm_axis_wrapper_hybrid.vhd (edit there to retarget)."
 
 # ===========================================================================
 # PHASE 6 -- Validate and generate output products for the BD
@@ -421,6 +431,6 @@ puts " Array size : ${N_GEMM}x${N_GEMM} ($N_GEMM\u00d7$N_GEMM = [expr $N_GEMM * 
 puts " Reports    : $reports_dir/"
 puts " XSA        : $proj_dir/$proj_name.xsa"
 puts ""
-puts " Re-run with different N:"
-puts "   vivado -mode batch -source prj_gemm_hybrid_axi.tcl -tclargs --N 8"
+puts " Re-run after editing array size in stoch_gemm_axis_wrapper_hybrid.vhd:"
+puts "   vivado -mode batch -source prj_gemm_hybrid_axi.tcl"
 puts "==================================================================""
