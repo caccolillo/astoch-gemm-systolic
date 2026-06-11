@@ -23,7 +23,8 @@
 #   stoch_gemm_top_hybrid.sv
 #   stoch_gemm_axis_hybrid.sv
 #   stoch_gemm_axis_wrapper_hybrid.vhd
-#   tb_stoch_gemm_hybrid.sv
+#   tb_stoch_gemm_hybrid.sv               (inner-core testbench, default top)
+#   tb_stoch_gemm_axis_hybrid_n22.sv      (AXI-Stream wrapper testbench, N=22)
 #   bd.tcl                              (the original block-design script)
 #   gemm_multicycle.xdc                 (multicycle path exceptions)
 #
@@ -106,6 +107,7 @@ set required {
     stoch_gemm_axis_hybrid.sv
     stoch_gemm_axis_wrapper_hybrid.vhd
     tb_stoch_gemm_hybrid.sv
+    tb_stoch_gemm_axis_hybrid_n22.sv
     bd.tcl
     gemm_multicycle.xdc
 }
@@ -175,10 +177,29 @@ puts "INFO: added multicycle constraints [file tail $mc_xdc] (PROCESSING_ORDER=L
 set tb_file [file normalize [file join $src_dir tb_stoch_gemm_hybrid.sv]]
 add_files -norecurse -fileset sim_1 $tb_file
 set_property file_type SystemVerilog [get_files [file tail $tb_file]]
-set_property top tb_stoch_gemm_hybrid [get_filesets sim_1]
+puts "INFO: added simulation testbench [file tail $tb_file]"
+
+# Wrapper-level testbench at N=22. Exercises the full AXI-Stream IP
+# (AXI-Lite control + operand AXI-Stream slave + result AXI-Stream master)
+# the same way the userspace gemm-test program does on real hardware.
+# Useful for diagnosing wrapper-level vs synthesis-level bugs.
+#
+# By default the inner-core testbench tb_stoch_gemm_hybrid is the sim top.
+# To switch to the wrapper testbench instead, comment out the line below
+# that sets `tb_stoch_gemm_hybrid` as top and uncomment the line that
+# sets `tb_stoch_gemm_axis_hybrid_n22` as top (further down).
+set tb_wrap_file [file normalize [file join $src_dir tb_stoch_gemm_axis_hybrid_n22.sv]]
+add_files -norecurse -fileset sim_1 $tb_wrap_file
+set_property file_type SystemVerilog [get_files [file tail $tb_wrap_file]]
+puts "INFO: added wrapper-level testbench [file tail $tb_wrap_file]"
+
+# Pick which testbench is the simulation top. Default = inner-core TB.
+# Swap the comments to switch.
+set_property top tb_stoch_gemm_hybrid           [get_filesets sim_1]
+# set_property top tb_stoch_gemm_axis_hybrid_n22 [get_filesets sim_1]
+
 set_property -name {xsim.simulate.runtime} -value {1000ms} \
     -objects [get_filesets sim_1]
-puts "INFO: added simulation testbench [file tail $tb_file]"
 
 # ===========================================================================
 # PHASE 3 -- update_compile_order so module references resolve
