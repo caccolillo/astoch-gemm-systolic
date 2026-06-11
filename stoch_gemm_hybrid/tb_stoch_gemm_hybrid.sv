@@ -25,7 +25,11 @@
 module tb_stoch_gemm_hybrid;
 
     // ---- Parameters (must match the DUT) ---------------------------------
-    localparam int N                  = 8;
+    // N=22 to match the hardware bitstream config on Ultra96-V2. The synthetic
+    // test image is still 8x8 (IMG_DIM=8), so the first 8 output positions
+    // have meaningful operands and positions 8..21 are zero-padded.
+    localparam int N                  = 22;
+    localparam int IMG_DIM            = 8;   // Synthetic 8x8 test image
     localparam int WIDTH              = 16;
     localparam int K                  = 9;
     localparam int K_SAR_BITS         = 8;
@@ -136,28 +140,33 @@ module tb_stoch_gemm_hybrid;
                     int rr, cc, pix;
                     rr = 0 + dr[k];
                     cc = li + dc[k];
-                    if (rr < 0 || rr >= 8 || cc < 0 || cc >= 8) pix = 0;
-                    else                                         pix = img[rr][cc];
-                    a_table[k][li] = enc(kern[k]);        // broadcast
-                    b_table[k][li] = enc(real'(pix) / pix_norm);
+                    if (rr < 0 || rr >= IMG_DIM ||
+                        cc < 0 || cc >= IMG_DIM) pix = 0;
+                    else                          pix = img[rr][cc];
+                    a_table[k][li] = enc(kern[k]);        // broadcast across rows
+                    b_table[k][li] = enc(real'(pix) / pix_norm);  // patch (or 0 for li >= IMG_DIM)
                 end
             end
         end
 
-        // Software reference (for the printout only; the Python scorer
-        // will recompute it as well).
+        // Software reference for printout. Positions 0..IMG_DIM-1 have real
+        // operands; positions IMG_DIM..N-1 had zero-padded operands so the
+        // expected output is 0.
         for (int i = 0; i < N; i++) begin
             real acc;
             int dr [9] = '{-1,-1,-1, 0, 0, 0, 1, 1, 1};
             int dc [9] = '{-1, 0, 1,-1, 0, 1,-1, 0, 1};
             acc = 0.0;
-            for (int k = 0; k < K; k++) begin
-                int rr, cc, pix;
-                rr = 0 + dr[k];
-                cc = i + dc[k];
-                if (rr < 0 || rr >= 8 || cc < 0 || cc >= 8) pix = 0;
-                else                                         pix = img[rr][cc];
-                acc = acc + kern[k] * (real'(pix) / pix_norm);
+            if (i < IMG_DIM) begin
+                for (int k = 0; k < K; k++) begin
+                    int rr, cc, pix;
+                    rr = 0 + dr[k];
+                    cc = i + dc[k];
+                    if (rr < 0 || rr >= IMG_DIM ||
+                        cc < 0 || cc >= IMG_DIM) pix = 0;
+                    else                          pix = img[rr][cc];
+                    acc = acc + kern[k] * (real'(pix) / pix_norm);
+                end
             end
             expected[i] = acc;
         end
@@ -204,26 +213,23 @@ module tb_stoch_gemm_hybrid;
             errors = 0;
             psnr_mse = 0.0;
             $display("");
-            $display(" pixel   c_flat   hw_pix    sw_pix    abs_err");
+            $display(" pixel   c_flat   hw_pix    sw_pix    abs_err   tag");
             for (int i = 0; i < N; i++) begin
                 cv = core_c_flat[(0*N+i)*RESW +: RESW];  // row 0, col i
                 $fwrite(fout, "%0d\n", $signed(cv));
-                // Mapping back to a real "pixel" value for printout:
-                //   real_value = c_flat * scale
-                //   where scale is the inverse of the encoding chain.
-                // The hybrid's internal scaling places the bipolar sum into
-                // [-2^(WIDTH-1), 2^(WIDTH-1)-1]. To convert back to a sum
-                // of bipolar products: divide by (2^(WIDTH-1) / K).
-                // hw_pix is the bipolar SUM of products over K terms.
-                // cv/2^(WIDTH-1) is the per-term average; multiply by K
-                // to get the sum. expected[i] already IS the sum
-                // (sum_k(kern_k/kmax * pix_k/255)), so no extra K factor.
                 hw_pix = real'(cv) / real'(1 << (WIDTH-1)) * real'(K);
                 sw_pix = expected[i];
                 err_pix = (hw_pix > sw_pix) ? (hw_pix - sw_pix) : (sw_pix - hw_pix);
-                psnr_mse = psnr_mse + err_pix * err_pix;
-                $display(" %4d   %8d   %7.4f   %7.4f   %7.4f",
-                         i, $signed(cv), hw_pix, sw_pix, err_pix);
+                // Only count errors from meaningful positions (0..IMG_DIM-1)
+                if (i < IMG_DIM) begin
+                    psnr_mse = psnr_mse + err_pix * err_pix;
+                    $display(" %4d   %8d   %7.4f   %7.4f   %7.4f   meaningful",
+                             i, $signed(cv), hw_pix, sw_pix, err_pix);
+                end else begin
+                    // Zero-padded positions: c_flat should be ~0
+                    $display(" %4d   %8d   %7.4f   %7.4f   %7.4f   zero-padded",
+                             i, $signed(cv), hw_pix, sw_pix, err_pix);
+                end
             end
             $fclose(fout);
 
@@ -237,7 +243,8 @@ module tb_stoch_gemm_hybrid;
             $fwrite(fout, "SAR_BIT_LEN %0d\n", SAR_BIT_LEN);
             $fclose(fout);
 
-            psnr_mse = psnr_mse / real'(N);
+            // PSNR uses only meaningful positions (0..IMG_DIM-1).
+            psnr_mse = psnr_mse / real'(IMG_DIM);
             if (psnr_mse > 0.0) begin
                 real psnr;
                 psnr = 10.0 * $ln(real'(K)*real'(K) / psnr_mse) / $ln(10.0);
