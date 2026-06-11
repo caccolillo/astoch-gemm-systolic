@@ -1,0 +1,20 @@
+// =============================================================================
+// stoch_gemm_uio.dtso
+// Patches the PetaLinux auto-generated device tree node for the
+// stoch_gemm_axis accelerator to use the in-kernel UIO driver.
+//
+// PetaLinux/XSA auto-generates the full node (reg, interrupts, clocks)
+// from the .xsa hardware description. We only need to override the
+// compatible string so uio_pdrv_genirq binds instead of a custom driver.
+//
+// Label confirmed from pl.dtsi:
+//   stoch_gemm_axis_0: stoch_gemm_axis_wrapper@a0000000
+//
+// The AXI DMA node already has compatible = "xlnx,axi-dma-1.00.a" from
+// the XSA -- the in-kernel xilinx-dma driver binds automatically.
+// No changes needed on the DMA node.
+// =============================================================================
+
+&stoch_gemm_axis_wrap_0 {
+    compatible = "generic-uio";
+};

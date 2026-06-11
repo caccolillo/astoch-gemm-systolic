@@ -1,0 +1,65 @@
+/*
+ * system-user.dtsi
+ *
+ * Device tree fragment for the Avnet Ultra96-V2 with the hybrid stochastic
+ * GEMM accelerator.
+ *
+ * Bug fixes baked in here (in order of pain inflicted during bring-up):
+ *
+ *   1. no-1-8-v on sdhci0
+ *      The Ultra96-V2 SD bank is hardwired to 1.8 V with no level shifter.
+ *      The kernel defaults to negotiating from 3.3 V down to 1.8 V at card
+ *      init; with no regulator to switch, this hangs forever. no-1-8-v
+ *      tells the sdhci driver to skip the negotiation.
+ *
+ *   2. uio_pdrv_genirq.of_id=generic-uio in bootargs
+ *      Setting compatible = "generic-uio" on a node is not enough by itself
+ *      to make uio_pdrv_genirq bind to it. The driver only auto-binds when
+ *      its of_id module parameter is set. The bootarg sets that parameter
+ *      at module load time, before any user code runs.
+ *
+ *   3. stoch_gemm_uio node with compatible = "generic-uio"
+ *      Binds the GEMM AXI-Lite region to a UIO device that user-space can
+ *      mmap, with the GEMM IRQ wired up so the test app can sleep on it
+ *      rather than poll.
+ */
+
+/include/ "system-conf.dtsi"
+/ {
+};
+
+/* ----- SD card 1.8 V fix (Ultra96-V2 specific) ---------------------------- */
+&sdhci0 {
+    no-1-8-v;
+    disable-wp;
+    xlnx,mio-bank = <0>;
+};
+
+/* ----- Boot args: enable UIO auto-bind for the GEMM node ------------------ */
+/* The 'chosen' node in the base ZynqMP DT is at /chosen but has no label,
+ * so we cannot use the &chosen reference. Use the root-relative form
+ * instead -- properties merge into the existing /chosen node. */
+/ {
+    chosen {
+        bootargs = "earlycon console=ttyPS0,115200 clk_ignore_unused root=/dev/mmcblk0p2 rw rootwait uio_pdrv_genirq.of_id=generic-uio cma=512M";
+    };
+};
+
+/* ----- GEMM accelerator: bind to generic-uio ------------------------------ */
+/*
+ * The GEMM accelerator's AXI-Lite registers occupy 64 KiB at 0xA0010000
+ * (matching the address map set in bd.tcl). The interrupt is wired to
+ * pl_ps_irq0[0], which on ZynqMP is SPI 89 from the PL.
+ *
+ * compatible string MUST match what is on the uio_pdrv_genirq.of_id kernel
+ * command-line argument above. We use "generic-uio".
+ */
+&amba {
+    stoch_gemm_axis_wrapper: stoch_gemm_axis_wrapper@a0010000 {
+        compatible = "generic-uio";
+        reg = <0x0 0xa0010000 0x0 0x10000>;
+        interrupt-parent = <&gic>;
+        interrupts = <0 89 1>;     /* SPI 89, level high */
+        status = "okay";
+    };
+};
