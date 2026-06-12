@@ -1,65 +1,48 @@
-# =============================================================================
-# gemm_multicycle.xdc
-# Multicycle path constraints for the hybrid stochastic GEMM accelerator.
+# ==============================================================================
+# Multi-Cycle Path Constraints for stoch_gemm_axis_hybrid
+# ==============================================================================
+# Source-of-truth hierarchy (verified against RTL):
+#   u_core           = stoch_gemm_top_hybrid (instance in stoch_gemm_axis_hybrid)
+#     u_array        = stoch_systolic_array_hybrid
+#       gen_pe_row[i].gen_pe_col[j].u_pe = stoch_pe_hybrid
+#         c_flat     = per-PE final result register
 #
-# These constraints inform Vivado that certain paths from AXI-Lite control
-# registers to the GEMM FSM are functionally allowed to take multiple
-# clock cycles. The registers are software-written once per job and remain
-# stable while the FSM is running, so they do not need to meet the standard
-# single-cycle setup requirement.
+# Filter strategy:
+#   Every cell query restricts to REF_NAME =~ FD* (FDRE, FDSE, FDCE, FDPE)
+#   to exclude Vivado-generated LUT cells whose names share a suffix with the
+#   register (e.g. core_a_bin_reg[0]_i_10). Without this restriction Vivado
+#   floods the log with [Constraints 18-401] "not a valid endpoint" warnings.
 #
-# Effect:
-#   * Gives placement and routing more flexibility on these paths
-#   * Releases timing pressure on paths that would otherwise be marginal
-#     when scaling to larger N or higher clock frequencies
-#   * Has no impact on functional behaviour (registers really are stable)
-#
-# Convention:
-#   * -setup 4 -hold 3   (paired pattern; do NOT use -setup alone)
-#   * The hold relaxation of N-1 compensates for the setup shift of N,
-#     keeping the hold check at the same effective edge as setup
-#
-# Verify in batch after impl:
-#   report_exceptions -multicycle_paths
-#
-# These constraints assume the standard cell-name pattern produced by the
-# stoch_gemm_axis_hybrid wrapper. If you rename the wrapper or its
-# registers, update the filter patterns below.
-# =============================================================================
+# Constraint #4 (s_axi_rdata) intentionally absent:
+#   s_axi_rdata is driven by an always_comb mux (line 224 of the wrapper),
+#   not registered. No *s_axi_rdata_reg* cells exist; the path from source
+#   registers to the output port is combinational and short enough to meet
+#   single-cycle timing without a multicycle.
+# ==============================================================================
 
-# ---------------------------------------------------------------------------
-# K_LEN register -> GEMM FSM term counter
-# Written once per tile by the userspace test app, then constant while the
-# FSM is running. The FSM samples it every cycle to compare against k_ctr.
-# ---------------------------------------------------------------------------
-set_multicycle_path 4 -setup \
-    -from [get_cells -hier -filter {NAME =~ */reg_klen_reg[*]}] \
-    -to   [get_cells -hier -filter {NAME =~ */u_core/*_reg[*]}]
-set_multicycle_path 3 -hold  \
-    -from [get_cells -hier -filter {NAME =~ */reg_klen_reg[*]}] \
-    -to   [get_cells -hier -filter {NAME =~ */u_core/*_reg[*]}]
+# ------------------------------------------------------------------------------
+# 1. AXI-Lite configuration registers (K_LEN, RES_PER_K)
+# Written once before CTRL.START, held constant for the whole run.
+# ------------------------------------------------------------------------------
+set_multicycle_path -setup -from [get_cells -hierarchical -filter {(NAME =~ *reg_klen_reg* || NAME =~ *reg_res_per_k_reg*) && REF_NAME =~ FD*}] 2
+set_multicycle_path -hold  -from [get_cells -hierarchical -filter {(NAME =~ *reg_klen_reg* || NAME =~ *reg_res_per_k_reg*) && REF_NAME =~ FD*}] 1
 
-# ---------------------------------------------------------------------------
-# RES_PER_K register -> GEMM FSM residue-stage cycle counter
-# Same pattern: written once per tile by software (replaces the original
-# hardware divider that was blocking timing closure).
-# ---------------------------------------------------------------------------
-set_multicycle_path 4 -setup \
-    -from [get_cells -hier -filter {NAME =~ */reg_res_per_k_reg[*]}] \
-    -to   [get_cells -hier -filter {NAME =~ */u_core/*_reg[*]}]
-set_multicycle_path 3 -hold  \
-    -from [get_cells -hier -filter {NAME =~ */reg_res_per_k_reg[*]}] \
-    -to   [get_cells -hier -filter {NAME =~ */u_core/*_reg[*]}]
+# ------------------------------------------------------------------------------
+# 2. Operand buffers -> core operand input registers
+# core_kidx is stable for many cycles per term (SAR_BIT_LEN or residue phase),
+# so the abuf/bbuf -> core_a_bin/core_b_bin mux+register path has 2-cycle slack.
+# ------------------------------------------------------------------------------
+set_multicycle_path -setup -from [get_cells -hierarchical -filter {(NAME =~ *abuf_reg* || NAME =~ *bbuf_reg*) && REF_NAME =~ FD*}] -to [get_cells -hierarchical -filter {(NAME =~ *core_a_bin_reg* || NAME =~ *core_b_bin_reg*) && REF_NAME =~ FD*}] 2
+set_multicycle_path -hold  -from [get_cells -hierarchical -filter {(NAME =~ *abuf_reg* || NAME =~ *bbuf_reg*) && REF_NAME =~ FD*}] -to [get_cells -hierarchical -filter {(NAME =~ *core_a_bin_reg* || NAME =~ *core_b_bin_reg*) && REF_NAME =~ FD*}] 1
 
-# ---------------------------------------------------------------------------
-# IRQ_EN bit -> IRQ output port
-# Slow-changing AXI-Lite bit; gates a single output. Multicycle relax is
-# safe because the receiving side (the PS interrupt controller) samples
-# the IRQ asynchronously.
-# ---------------------------------------------------------------------------
-set_multicycle_path 4 -setup \
-    -from [get_cells -hier -filter {NAME =~ */reg_irqen_reg}] \
-    -to   [get_ports irq]
-set_multicycle_path 3 -hold  \
-    -from [get_cells -hier -filter {NAME =~ */reg_irqen_reg}] \
-    -to   [get_ports irq]
+# ------------------------------------------------------------------------------
+# 3. PE result registers -> output streaming logic
+# After core_done asserts, all N*N c_flat values are stable until the next
+# core_start; the muxer reads them out at one PE per beat over many cycles.
+# ------------------------------------------------------------------------------
+set_multicycle_path -setup -from [get_cells -hierarchical -filter {NAME =~ *u_array*gen_pe_row*gen_pe_col*u_pe*c_flat_reg* && REF_NAME =~ FD*}] -to [get_cells -hierarchical -filter {(NAME =~ *reg_ocount_reg* || NAME =~ *out_idx_reg*) && REF_NAME =~ FD*}] 2
+set_multicycle_path -hold  -from [get_cells -hierarchical -filter {NAME =~ *u_array*gen_pe_row*gen_pe_col*u_pe*c_flat_reg* && REF_NAME =~ FD*}] -to [get_cells -hierarchical -filter {(NAME =~ *reg_ocount_reg* || NAME =~ *out_idx_reg*) && REF_NAME =~ FD*}] 1
+
+# ==============================================================================
+# End of multicycle constraints (3 setup/hold pairs)
+# ==============================================================================

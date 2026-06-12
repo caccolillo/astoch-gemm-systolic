@@ -47,7 +47,7 @@ entity stoch_gemm_axis_wrapper_hybrid is
         SAR_BIT_LEN         : integer := 32;
         STREAM_LEN_RESIDUE  : integer := 65536;
         KW                  : integer := 16;
-        KBUF_MAX            : integer := 64;
+        KBUF_MAX            : integer := 16;
         C_S_AXI_ADDR_WIDTH  : integer := 12;
         C_S_AXI_DATA_WIDTH  : integer := 32
     );

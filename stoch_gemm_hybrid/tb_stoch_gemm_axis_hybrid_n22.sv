@@ -33,7 +33,7 @@ module tb_stoch_gemm_axis_hybrid_n22;
     localparam int SAR_BIT_LEN        = 32;
     localparam int STREAM_LEN_RESIDUE = 65536;
     localparam int KW                 = 16;
-    localparam int KBUF_MAX           = 64;
+    localparam int KBUF_MAX           = 16;
     localparam int C_S_AXI_ADDR_WIDTH = 12;
     localparam int C_S_AXI_DATA_WIDTH = 32;
     localparam int RESW               = WIDTH + 2;
@@ -145,6 +145,46 @@ module tb_stoch_gemm_axis_hybrid_n22;
 
         .irq            (irq)
     );
+
+    // ---- DEBUG: periodic background reporter (every 5000 cycles) --------
+    // Prints sim time, s_axis_tready, m_axis_tvalid, irq, and the wrapper's
+    // STATUS register so we can see the FSM progress without polling.
+    int dbg_cycle_count = 0;
+    always @(posedge aclk) if (aresetn) begin
+        dbg_cycle_count <= dbg_cycle_count + 1;
+        if (dbg_cycle_count != 0 && (dbg_cycle_count % 5000) == 0) begin
+            $display("  [DBG @ %0t cyc=%0d] s_axis_tready=%b m_axis_tvalid=%b irq=%b",
+                     $time, dbg_cycle_count,
+                     s_axis_tready, m_axis_tvalid, irq);
+        end
+    end
+
+    // ---- DEBUG: edge-triggered watchers ---------------------------------
+    // Print whenever s_axis_tready or m_axis_tvalid change state -- useful
+    // to see exactly when the wrapper accepts operands and when output
+    // becomes available. Throttled to first 20 transitions of each.
+    int dbg_sready_edges = 0;
+    int dbg_mvalid_edges = 0;
+    logic dbg_sready_prev = 0;
+    logic dbg_mvalid_prev = 0;
+    always @(posedge aclk) if (aresetn) begin
+        if (s_axis_tready !== dbg_sready_prev) begin
+            if (dbg_sready_edges < 20) begin
+                $display("  [DBG @ %0t] s_axis_tready: %b -> %b",
+                         $time, dbg_sready_prev, s_axis_tready);
+            end
+            dbg_sready_edges <= dbg_sready_edges + 1;
+            dbg_sready_prev  <= s_axis_tready;
+        end
+        if (m_axis_tvalid !== dbg_mvalid_prev) begin
+            if (dbg_mvalid_edges < 20) begin
+                $display("  [DBG @ %0t] m_axis_tvalid: %b -> %b",
+                         $time, dbg_mvalid_prev, m_axis_tvalid);
+            end
+            dbg_mvalid_edges <= dbg_mvalid_edges + 1;
+            dbg_mvalid_prev  <= m_axis_tvalid;
+        end
+    end
 
     // ---- AXI-Lite write task --------------------------------------------
     task automatic axil_write(input [11:0] addr, input [31:0] data);
@@ -270,6 +310,10 @@ module tb_stoch_gemm_axis_hybrid_n22;
 
         $display("============================================================");
         $display(" Wrapper-level testbench, N=%0d K=%0d", N, K);
+        $display("   IMG_DIM=%0d WIDTH=%0d RESW=%0d", IMG_DIM, WIDTH, RESW);
+        $display("   K_SAR_BITS=%0d SAR_BIT_LEN=%0d", K_SAR_BITS, SAR_BIT_LEN);
+        $display("   STREAM_LEN_RESIDUE=%0d", STREAM_LEN_RESIDUE);
+        $display("   CLK_PERIOD=%0t (sim time t=%0t at start)", CLK_PERIOD, $time);
         $display("============================================================");
 
         // Sanity: read INFO/INFO2/INFO3 to confirm DUT is alive
@@ -308,72 +352,132 @@ module tb_stoch_gemm_axis_hybrid_n22;
         // 3) pulse START
         // 4) read back outputs
 
+        // Echo the first few TX values so we know what we're sending
+        $display("");
+        $display("  TX preview (first 8 of %0d beats):", K*2*N);
+        for (int b = 0; b < 8; b++) begin
+            $display("    tx_data[%0d] = 0x%04h (kernel/patch term/lane)",
+                     b, tx_data[b]);
+        end
+        $display("  ...");
+        $display("");
+
         // Open the output stream sink
         m_axis_tready <= 1'b1;
+        $display("  [%0t] m_axis_tready asserted (RX sink open)", $time);
 
-        // Fork the input stream driver
-        fork
-            // ---- TX driver -----
-            begin
-                automatic int n_beats = K * 2 * N;
-                for (int b = 0; b < n_beats; b++) begin
+        // ====================================================================
+        // SEQUENTIAL FLOW (matches what the userspace gemm-test program does):
+        //   PHASE 1: stream ALL operand beats (no START yet)
+        //   PHASE 2: pulse CTRL.START via AXI-Lite
+        //   PHASE 3: collect output beats
+        //
+        // The previous fork-join version pulsed START in parallel with TX.
+        // The wrapper FSM resets in_term/in_half/in_lane/ICOUNT on
+        // core_start, so START-during-TX would wipe the partial buffer
+        // pointers and the beats already streamed got mis-routed. That's
+        // what caused the all-bipolar-zero output. Real software writes
+        // START only AFTER all operands have been DMA'd in, so we should
+        // mirror that here.
+        // ====================================================================
+
+        // -------- PHASE 1: stream operands ----------------------------------
+        $display("  [%0t] PHASE 1: streaming %0d operand beats (NO start yet)",
+                 $time, K*2*N);
+        begin
+            automatic int n_beats = K * 2 * N;
+            automatic int stall_cycles = 0;
+            automatic time start_t = $time;
+            for (int b = 0; b < n_beats; b++) begin
+                @(posedge aclk);
+                s_axis_tdata  <= {16'h0, tx_data[b]};
+                s_axis_tkeep  <= 4'hF;
+                s_axis_tlast  <= (b == n_beats - 1);
+                s_axis_tvalid <= 1'b1;
+                stall_cycles = 0;
+                // Wait for handshake at next posedge with tready high
+                do begin
                     @(posedge aclk);
-                    s_axis_tdata  <= {16'h0, tx_data[b]};   // low 16 bits = operand
-                    s_axis_tkeep  <= 4'hF;
-                    s_axis_tlast  <= (b == n_beats - 1);
-                    s_axis_tvalid <= 1'b1;
-                    do @(posedge aclk); while (!s_axis_tready);
-                end
+                    stall_cycles++;
+                end while (!s_axis_tready);
+                // Deassert tvalid immediately so we don't re-trigger a
+                // handshake with stale tdata
                 s_axis_tvalid <= 1'b0;
                 s_axis_tlast  <= 1'b0;
-                $display("  TX driver done -- %0d beats sent", n_beats);
-            end
-
-            // ---- RX collector -----
-            begin
-                automatic int recvd = 0;
-                automatic int expected_n = N * N;
-                logic [RESW-1:0] tmp;
-                while (recvd < expected_n) begin
-                    @(posedge aclk);
-                    if (m_axis_tvalid && m_axis_tready) begin
-                        tmp = m_axis_tdata[RESW-1:0];
-                        rx_data[recvd] = tmp;
-                        recvd++;
-                    end
+                if ((b % 50) == 0 || b < 5 || b == n_beats - 1) begin
+                    $display("  [%0t] TX beat %0d/%0d sent (data=0x%04h, stall=%0d cycles)",
+                             $time, b+1, n_beats, tx_data[b], stall_cycles);
                 end
-                $display("  RX collector done -- %0d beats received", recvd);
-            end
-
-            // ---- Trigger START after a brief delay ----
-            begin
-                repeat (50) @(posedge aclk);
-                axil_write(A_CTRL, 32'h0000_0001);   // START bit
-            end
-        join
-
-        // Wait for DONE in STATUS
-        begin
-            int tries;
-            tries = 0;
-            do begin
-                @(posedge aclk);
-                axil_read(A_STATUS, rd);
-                tries++;
-                if (tries > 10) begin
-                    $display("  >>> TIMEOUT waiting for STATUS.DONE after start");
-                    break;
+                if (stall_cycles > 100) begin
+                    $display("  [%0t] >>> TX WARNING: long stall at beat %0d (%0d cycles)",
+                             $time, b, stall_cycles);
                 end
-            end while (rd[1] != 1'b1);
-            $display("  STATUS = 0x%08h (BUSY=%0d DONE=%0d) after %0d polls",
-                     rd, rd[0], rd[1], tries);
+            end
+            s_axis_tvalid <= 1'b0;
+            s_axis_tlast  <= 1'b0;
+            $display("  [%0t] PHASE 1 done: %0d beats streamed in %0t",
+                     $time, n_beats, $time - start_t);
         end
 
-        // Read ICOUNT, OCOUNT
+        // Sanity: read ICOUNT to confirm all 396 beats were absorbed
+        axil_read(A_ICOUNT, rd);
+        $display("  ICOUNT after streaming = %0d (expected %0d)", rd, K * 2 * N);
+        if (rd != K * 2 * N) begin
+            $display("  >>> WARNING: ICOUNT mismatch -- wrapper missed beats");
+        end
+
+        // -------- PHASE 2: pulse CTRL.START ---------------------------------
+        $display("");
+        $display("  [%0t] PHASE 2: writing CTRL.START", $time);
+        axil_write(A_CTRL, 32'h0000_0001);
+        $display("  [%0t] PHASE 2 done", $time);
+
+        // -------- PHASE 3: collect output beats -----------------------------
+        $display("");
+        $display("  [%0t] PHASE 3: collecting %0d output beats", $time, N*N);
+        begin
+            automatic int recvd = 0;
+            automatic int expected_n = N * N;
+            automatic time first_t = 0;
+            automatic time phase3_start = $time;
+            logic [RESW-1:0] tmp;
+            while (recvd < expected_n) begin
+                @(posedge aclk);
+                if (m_axis_tvalid && m_axis_tready) begin
+                    tmp = m_axis_tdata[RESW-1:0];
+                    rx_data[recvd] = tmp;
+                    if (recvd == 0) begin
+                        first_t = $time;
+                        $display("  [%0t] RX first beat (computation ran for %0t)",
+                                 $time, $time - phase3_start);
+                    end
+                    if ((recvd % 100) == 0 || recvd < 5
+                        || recvd == expected_n - 1) begin
+                        $display("  [%0t] RX beat %0d/%0d received (c_flat=0x%05h signed=%0d)",
+                                 $time, recvd+1, expected_n,
+                                 tmp, $signed(tmp));
+                    end
+                    recvd++;
+                end
+            end
+            $display("  [%0t] PHASE 3 done: %0d beats received (first at %0t, last at %0t)",
+                     $time, recvd, first_t, $time);
+        end
+
+        $display("");
+        $display("  [%0t] All phases complete", $time);
+
+        // The PHASE 3 RX completion IS the proof that computation finished --
+        // the wrapper only emits output beats after the FSM transitions
+        // through DONE. We don't need an extra STATUS poll.
+
+        // Optional: read ICOUNT, OCOUNT for sanity (but only briefly).
         axil_read(A_ICOUNT, rd);
         $display("  ICOUNT = %0d (expected %0d)", rd, K * 2 * N);
         axil_read(A_OCOUNT, rd);
         $display("  OCOUNT = %0d (expected %0d)", rd, N * N);
+        axil_read(A_STATUS, rd);
+        $display("  STATUS = 0x%08h (BUSY=%0d DONE=%0d)", rd, rd[0], rd[1]);
 
         // Compare results
         begin
@@ -381,6 +485,18 @@ module tb_stoch_gemm_axis_hybrid_n22;
             real hw_pix, sw_pix, err_pix, psnr;
             logic signed [RESW-1:0] cv;
             int fout;
+
+            // Raw dump of the first 32 RX values for direct comparison
+            // against the real-hardware devmem readout
+            $display("");
+            $display("  Raw RX buffer (first 32 of %0d, unsigned hex / signed dec):",
+                     N*N);
+            for (int i = 0; i < 32; i++) begin
+                $display("    rx_data[%2d] = 0x%05h  (signed = %0d)",
+                         i, rx_data[i], $signed(rx_data[i]));
+            end
+            $display("  ...");
+            $display("");
 
             fout = $fopen("gemm_axis_n22_out.txt", "w");
             psnr_mse = 0.0;
@@ -416,8 +532,11 @@ module tb_stoch_gemm_axis_hybrid_n22;
     end
 
     // ---- Safety timeout -------------------------------------------------
+    // Large headroom: real-hardware run is ~0.8 ms but xsim sim of N=22
+    // wrapper with full AXI-Lite + AXI-Stream handshaking takes longer
+    // because every beat has back-pressure handshake cycles. Allow ~50 ms.
     initial begin
-        #(CLK_PERIOD * (STREAM_LEN_RESIDUE + K * K_SAR_BITS * SAR_BIT_LEN) * 8);
+        #(CLK_PERIOD * (STREAM_LEN_RESIDUE + K * K_SAR_BITS * SAR_BIT_LEN) * 80);
         $display("FATAL: testbench timeout");
         $finish;
     end

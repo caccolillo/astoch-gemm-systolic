@@ -37,7 +37,7 @@ module stoch_gemm_axis_hybrid #(
     parameter int SAR_BIT_LEN        = 32,
     parameter int STREAM_LEN_RESIDUE = 65536,
     parameter int KW                 = 16,
-    parameter int KBUF_MAX           = 64,
+    parameter int KBUF_MAX           = 16,
     parameter int C_S_AXI_ADDR_WIDTH = 12,
     parameter int C_S_AXI_DATA_WIDTH = 32
 ) (
@@ -100,7 +100,10 @@ module stoch_gemm_axis_hybrid #(
     localparam logic [3:0] A_INFO3  = 4'hC; // 0x1C
 
     // The original wrapper uses 5-bit address decoding internally. Same here.
-    logic [4:0] aw_addr_q, ar_addr_q;
+    // 6-bit address decode: needs to reach 0x20 (RES_PER_K register).
+    // Was 5 bits which silently aliased 0x20 onto 0x00 (CTRL register)
+    // and made writes to RES_PER_K invisible -- they pulsed START instead.
+    logic [5:0] aw_addr_q, ar_addr_q;
 
     logic [KW-1:0]  reg_klen;
     logic [31:0]    reg_res_per_k;     // res_per_k written by software
@@ -149,7 +152,7 @@ module stoch_gemm_axis_hybrid #(
                     s_axi_wready  <= 1'b0;
                     s_axi_bvalid  <= 1'b0;
                     if (s_axi_awvalid) begin
-                        aw_addr_q     <= s_axi_awaddr[4:0];
+                        aw_addr_q     <= s_axi_awaddr[5:0];
                         s_axi_awready <= 1'b0;
                         s_axi_wready  <= 1'b1;
                         aw_state      <= AW_DATA;
@@ -158,12 +161,12 @@ module stoch_gemm_axis_hybrid #(
                 AW_DATA: begin
                     if (s_axi_wvalid) begin
                         case (aw_addr_q)
-                            5'h00: begin // CTRL
+                            6'h00: begin // CTRL
                                 if (s_axi_wdata[0]) core_start <= 1'b1;
                                 reg_irqen <= s_axi_wdata[1];
                             end
-                            5'h08: reg_klen <= s_axi_wdata[KW-1:0];
-                            5'h20: reg_res_per_k <= s_axi_wdata[31:0];
+                            6'h08: reg_klen <= s_axi_wdata[KW-1:0];
+                            6'h20: reg_res_per_k <= s_axi_wdata[31:0];
                             default: ;
                         endcase
                         s_axi_wready <= 1'b0;
@@ -200,7 +203,7 @@ module stoch_gemm_axis_hybrid #(
                     s_axi_arready <= 1'b1;
                     s_axi_rvalid  <= 1'b0;
                     if (s_axi_arvalid) begin
-                        ar_addr_q     <= s_axi_araddr[4:0];
+                        ar_addr_q     <= s_axi_araddr[5:0];
                         s_axi_arready <= 1'b0;
                         s_axi_rvalid  <= 1'b1;
                         s_axi_rresp   <= 2'b00;
@@ -221,16 +224,16 @@ module stoch_gemm_axis_hybrid #(
     always_comb begin
         s_axi_rdata = 32'd0;
         case (ar_addr_q)
-            5'h00: s_axi_rdata = {30'd0, reg_irqen, 1'b0};                // CTRL
-            5'h04: s_axi_rdata = {30'd0, done_sticky, core_busy};         // STATUS
-            5'h08: s_axi_rdata = {{(32-KW){1'b0}}, reg_klen};             // K_LEN
-            5'h0C: s_axi_rdata = {RESW[7:0], CNTW[7:0], KW[7:0], N[7:0]}; // INFO
+            6'h00: s_axi_rdata = {30'd0, reg_irqen, 1'b0};                // CTRL
+            6'h04: s_axi_rdata = {30'd0, done_sticky, core_busy};         // STATUS
+            6'h08: s_axi_rdata = {{(32-KW){1'b0}}, reg_klen};             // K_LEN
+            6'h0C: s_axi_rdata = {RESW[7:0], CNTW[7:0], KW[7:0], N[7:0]}; // INFO
             // INFO2 high bit set to mark hybrid converter mode
-            5'h10: s_axi_rdata = {1'b1, 7'd0, STREAM_LEN_RESIDUE[23:0]};   // INFO2
-            5'h14: s_axi_rdata = reg_icount;                              // ICOUNT
-            5'h18: s_axi_rdata = reg_ocount;                              // OCOUNT
-            5'h1C: s_axi_rdata = {16'd0, SAR_BIT_LEN[7:0], K_SAR_BITS[7:0]}; // INFO3
-            5'h20: s_axi_rdata = reg_res_per_k;                           // RES_PER_K
+            6'h10: s_axi_rdata = {1'b1, 7'd0, STREAM_LEN_RESIDUE[23:0]};   // INFO2
+            6'h14: s_axi_rdata = reg_icount;                              // ICOUNT
+            6'h18: s_axi_rdata = reg_ocount;                              // OCOUNT
+            6'h1C: s_axi_rdata = {16'd0, SAR_BIT_LEN[7:0], K_SAR_BITS[7:0]}; // INFO3
+            6'h20: s_axi_rdata = reg_res_per_k;                           // RES_PER_K
             default: s_axi_rdata = 32'd0;
         endcase
     end
@@ -275,19 +278,25 @@ module stoch_gemm_axis_hybrid #(
     end
 
     // ---- Drive core operand buses from buffers ---------------------------
+    // CRITICAL: the previous bounds check
+    //     if (core_kidx < KBUF_MAX[$clog2(KBUF_MAX)-1:0]) ...
+    // was BROKEN because KBUF_MAX[5:0] for KBUF_MAX=64 (=0b01000000) is 0.
+    // The comparison was therefore "core_kidx < 0", always false, and the
+    // wrapper unconditionally drove core_a_bin/core_b_bin to zero -- the
+    // core saw all-zero operands and saturated c_flat at max-positive
+    // (bipolar-product (-1)x(-1) = +1 every term, summed = +K).
+    //
+    // Direct indexing is safe here: core_kidx is $clog2(KBUF_MAX) bits wide
+    // (6 bits for KBUF_MAX=64) and abuf has exactly KBUF_MAX entries, so
+    // every value of core_kidx is in range by construction.
     always_ff @(posedge aclk) begin
         if (!aresetn) begin
             core_a_bin <= '0;
             core_b_bin <= '0;
         end else begin
             for (int li = 0; li < N; li++) begin
-                if (core_kidx < KBUF_MAX[$clog2(KBUF_MAX)-1:0]) begin
-                    core_a_bin[li*WIDTH +: WIDTH] <= abuf[core_kidx][li];
-                    core_b_bin[li*WIDTH +: WIDTH] <= bbuf[core_kidx][li];
-                end else begin
-                    core_a_bin[li*WIDTH +: WIDTH] <= '0;
-                    core_b_bin[li*WIDTH +: WIDTH] <= '0;
-                end
+                core_a_bin[li*WIDTH +: WIDTH] <= abuf[core_kidx][li];
+                core_b_bin[li*WIDTH +: WIDTH] <= bbuf[core_kidx][li];
             end
         end
     end

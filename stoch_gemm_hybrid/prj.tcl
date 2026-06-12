@@ -59,7 +59,7 @@ set N_GEMM     22
 set K_SAR_BITS 8
 set SAR_BIT_LEN 32
 set STREAM_LEN_RESIDUE 65536
-set KBUF_MAX   64
+set KBUF_MAX   16
 
 # Flow runs all phases unconditionally. Only project / part / src_dir
 # can be overridden at the command line; ARRAY SIZING IS NOT OVERRIDABLE
