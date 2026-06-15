@@ -343,6 +343,60 @@ BB
 
 info "gemm-test recipe created"
 
+# ---------------------------------------------------------------------------
+# STEP 7b -- gemm-image library recipe (conditional; only if lib is staged)
+# Sets $GEMM_IMAGE_PKG="gemm-image" when the recipe is created, otherwise
+# leaves it unset so the package-install loops below skip it.
+# ---------------------------------------------------------------------------
+GEMM_IMAGE_PKG=""
+# Library files may live either in $SCRIPT_DIR/gemm_image_lib/ (preferred,
+# keeps the script dir tidy) or directly at the top of $SCRIPT_DIR (flat
+# layout). We detect either, using kernels.c as the existence marker.
+if [ -f "$SCRIPT_DIR/gemm_image_lib/kernels.c" ]; then
+    GEMM_IMG_SRC="$SCRIPT_DIR/gemm_image_lib"
+elif [ -f "$SCRIPT_DIR/kernels.c" ]; then
+    GEMM_IMG_SRC="$SCRIPT_DIR"
+else
+    GEMM_IMG_SRC=""
+fi
+
+if [ -n "$GEMM_IMG_SRC" ]; then
+    step "7b/12 Creating gemm-image library recipe"
+    GEMM_IMG_DIR="$PROJ_DIR/project-spec/meta-user/recipes-apps/gemm-image"
+    GEMM_IMG_FILES="$GEMM_IMG_DIR/files"
+    mkdir -p "$GEMM_IMG_FILES"
+
+    for f in gemm_image.h bmp.h bmp.c fpga.h fpga.c kernels.h kernels.c gemm_image_main.c; do
+        cp "$GEMM_IMG_SRC/$f" "$GEMM_IMG_FILES/$f"
+    done
+
+cat > "$GEMM_IMG_DIR/gemm-image.bb" << 'BB'
+SUMMARY = "Stochastic GEMM 35-kernel image-processing library"
+LICENSE = "MIT"
+LIC_FILES_CHKSUM = "file://${COMMON_LICENSE_DIR}/MIT;md5=0835ade698e0bcf8506ecda2f7b4f302"
+FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+SRC_URI = "file://gemm_image.h file://bmp.h file://bmp.c file://fpga.h \
+           file://fpga.c file://kernels.h file://kernels.c file://gemm_image_main.c"
+S = "${WORKDIR}"
+do_compile() {
+    ${CC} ${CFLAGS} ${LDFLAGS} -O2 -Wall -I${WORKDIR} \
+        -o ${WORKDIR}/gemm-image \
+        ${WORKDIR}/gemm_image_main.c ${WORKDIR}/bmp.c ${WORKDIR}/fpga.c ${WORKDIR}/kernels.c -lm
+}
+do_install() {
+    install -d ${D}${bindir}
+    install -m 0755 ${WORKDIR}/gemm-image ${D}${bindir}/gemm-image
+}
+FILES:${PN} += "${bindir}/gemm-image"
+BB
+
+    GEMM_IMAGE_PKG="gemm-image"
+    info "gemm-image recipe created"
+else
+    error "Library sources not found: expected either $SCRIPT_DIR/gemm_image_lib/kernels.c or $SCRIPT_DIR/kernels.c -- gemm-image will NOT be installed"
+fi
+
+
 # =============================================================================
 # STEP 9 — Enable packages in rootfs
 # =============================================================================
@@ -354,7 +408,7 @@ ROOTFS_CFG="$PROJ_DIR/project-spec/meta-user/conf/user-rootfsconfig"
 mkdir -p "$(dirname "$ROOTFS_CFG")"
 touch "$ROOTFS_CFG"
 
-for pkg in gemm-test; do
+for pkg in gemm-test $GEMM_IMAGE_PKG; do
     if ! grep -q "CONFIG_${pkg}" "$ROOTFS_CFG"; then
         echo "CONFIG_${pkg}=y" >> "$ROOTFS_CFG"
         info "Enabled package: $pkg"
@@ -369,7 +423,7 @@ PLNX_ROOTFS_CFG="$PROJ_DIR/project-spec/configs/rootfs_config"
 # Ensure the config file exists.
 touch "$PLNX_ROOTFS_CFG"
 
-for pkg in gemm-test devmem2 packagegroup-petalinux-utils; do
+for pkg in gemm-test $GEMM_IMAGE_PKG devmem2 packagegroup-petalinux-utils; do
     if ! grep -q "CONFIG_${pkg}=y" "$PLNX_ROOTFS_CFG"; then
         echo "CONFIG_${pkg}=y" >> "$PLNX_ROOTFS_CFG"
         info "Added to rootfs_config: $pkg"
