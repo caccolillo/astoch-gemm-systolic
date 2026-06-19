@@ -391,6 +391,8 @@ write_run_reports synth_1 $reports_dir
 # the bitstream step in flight when the next phase starts.
 # ===========================================================================
 puts "\n==> PHASE 9: launching implementation + write_bitstream (single run)"
+#set_property strategy Performance_ExplorePostRoutePhysOpt [get_runs impl_1]
+set_property strategy Performance_NetDelay_high [get_runs impl_1]
 launch_runs impl_1 -to_step write_bitstream -jobs 8
 wait_on_run impl_1
 set impl_status [get_property STATUS   [get_runs impl_1]]

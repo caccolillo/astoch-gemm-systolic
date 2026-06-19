@@ -18,6 +18,19 @@
 #   not registered. No *s_axi_rdata_reg* cells exist; the path from source
 #   registers to the output port is combinational and short enough to meet
 #   single-cycle timing without a multicycle.
+#
+# MAX_FANOUT section REMOVED:
+#   Earlier attempt to constrain MAX_FANOUT=64 on FSM_onehot_state_reg
+#   caused phys_opt_design to create ~96 replicas of a 6181-fanout signal.
+#   On the xczu3eg (small device, ~70k LUTs, already ~80% utilised by the
+#   22x22 systolic array), this drove vertical wire utilisation to 88.5%
+#   and routing failed:
+#       ERROR: [Route 35-5] Design is not routable as its vertical wire
+#       utilisation is 88.50 %.
+#   The lesson: aggressive register replication is a tool for large
+#   underutilised devices, not for designs that already pack the chip.
+#   The AXI-Stream register slice added in stoch_gemm_axis_wrapper_hybrid.vhd
+#   does the same job (shortens the worst route) without spreading logic.
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -44,5 +57,5 @@ set_multicycle_path -setup -from [get_cells -hierarchical -filter {NAME =~ *u_ar
 set_multicycle_path -hold  -from [get_cells -hierarchical -filter {NAME =~ *u_array*gen_pe_row*gen_pe_col*u_pe*c_flat_reg* && REF_NAME =~ FD*}] -to [get_cells -hierarchical -filter {(NAME =~ *reg_ocount_reg* || NAME =~ *out_idx_reg*) && REF_NAME =~ FD*}] 1
 
 # ==============================================================================
-# End of multicycle constraints (3 setup/hold pairs)
+# End of constraints (3 multicycle pairs)
 # ==============================================================================

@@ -148,6 +148,35 @@ architecture structural of stoch_gemm_axis_wrapper_hybrid is
     signal s_axis_tkeep_int : std_logic_vector(3 downto 0);
     signal m_axis_tkeep_int : std_logic_vector(3 downto 0);
 
+    -- =====================================================================
+    -- Forward register slice on the master AXI-Stream output (M_AXIS).
+    --
+    -- Why: the ~484:1 mux that selects which PE's c_flat to drive onto
+    -- m_axis_tdata sits inside u_axis, far from the downstream AXI-Stream
+    -- FIFO. Without a register at the wrapper boundary the path
+    --
+    --   PE c_flat_reg -> 484:1 mux -> wrapper output -> FIFO BRAM DIN
+    --
+    -- is one combinational hop that has to span the whole die (~2.5 ns of
+    -- pure route at 300 MHz, fails timing). Capturing the muxed value in
+    -- a flop right at the wrapper output splits this into two short hops,
+    -- each comfortably inside one clock period.
+    --
+    -- This is a textbook forward AXI-Stream register slice: no
+    -- combinational path from input to output, full handshake
+    -- compliance, one cycle of added latency. Throughput unchanged when
+    -- downstream keeps up (it almost always does -- the FIFO has many
+    -- slots and runs at the same clock).
+    -- =====================================================================
+    signal core_m_tdata  : std_logic_vector(31 downto 0);
+    signal core_m_tlast  : std_logic;
+    signal core_m_tvalid : std_logic;
+    signal core_m_tready : std_logic;
+
+    signal reg_m_tdata   : std_logic_vector(31 downto 0) := (others => '0');
+    signal reg_m_tlast   : std_logic := '0';
+    signal reg_m_tvalid  : std_logic := '0';
+
 begin
 
     -- The block design AXI-Stream interface usually does not expose TKEEP;
@@ -194,12 +223,44 @@ begin
             s_axis_tlast    => s_axis_tlast,
             s_axis_tvalid   => s_axis_tvalid,
             s_axis_tready   => s_axis_tready,
-            m_axis_tdata    => m_axis_tdata,
+            m_axis_tdata    => core_m_tdata,
             m_axis_tkeep    => m_axis_tkeep_int,
-            m_axis_tlast    => m_axis_tlast,
-            m_axis_tvalid   => m_axis_tvalid,
-            m_axis_tready   => m_axis_tready,
+            m_axis_tlast    => core_m_tlast,
+            m_axis_tvalid   => core_m_tvalid,
+            m_axis_tready   => core_m_tready,
             irq             => irq
         );
+
+    -- ---------------------------------------------------------------------
+    -- Forward register slice (M_AXIS):
+    --
+    -- Producer (u_axis) is ready to push a new beat into the slice when
+    -- either the slice is empty (reg_m_tvalid='0') or the downstream FIFO
+    -- is consuming the current beat this cycle (m_axis_tready='1').
+    -- ---------------------------------------------------------------------
+    core_m_tready <= (not reg_m_tvalid) or m_axis_tready;
+
+    process(aclk)
+    begin
+        if rising_edge(aclk) then
+            if aresetn = '0' then
+                reg_m_tvalid <= '0';
+                reg_m_tlast  <= '0';
+                reg_m_tdata  <= (others => '0');
+            else
+                if (reg_m_tvalid = '0') or (m_axis_tready = '1') then
+                    -- Slice empty OR downstream consuming this cycle:
+                    -- accept the next beat from the producer.
+                    reg_m_tdata  <= core_m_tdata;
+                    reg_m_tlast  <= core_m_tlast;
+                    reg_m_tvalid <= core_m_tvalid;
+                end if;
+            end if;
+        end if;
+    end process;
+
+    m_axis_tdata  <= reg_m_tdata;
+    m_axis_tlast  <= reg_m_tlast;
+    m_axis_tvalid <= reg_m_tvalid;
 
 end architecture structural;

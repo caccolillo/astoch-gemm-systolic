@@ -121,11 +121,41 @@ module stoch_gemm_top_hybrid #(
         S_FINALISE,
         S_DONE
     } state_t;
-    state_t state;
+    // ----------------------------------------------------------------------
+    // MAX_FANOUT 128: the FSM state register fans out to a clock-enable pin
+    // on every counter register inside all N*N PEs (6181 endpoints for N=22).
+    // 128 is the sweet spot for this design+device combo. Tighter values
+    // were tried and rejected:
+    //   - MAX_FANOUT 64 via LATE-order XDC: pushed wire utilisation to
+    //     88.5%, route_design failed (Route 35-5).
+    //   - MAX_FANOUT 64 via synth attribute: built fine but spread placement
+    //     too far, made WNS WORSE (-0.272 vs -0.153 at 128) because the
+    //     484:1 output mux path through PE c_flat -> reg_m_tdata_reg now
+    //     dominates and is sensitive to placement spread.
+    // The takeaway: more replication isn't always better. 128 leaves the
+    // FSM-to-PE paths quiet enough that the 484:1 mux is the real ceiling.
+    (* MAX_FANOUT = 128 *) state_t state;
 
-    logic [$clog2(WIDTH+1)-1:0]  bit_ctr;   // current SAR bit (counts down)
+    // MAX_FANOUT 128: bit_ctr is the SAR-bit counter, written every
+    // SAR_BIT_LEN cycles during the SAR phase. Like the FSM state, it
+    // distributes broadly to PE counter-enable logic and was the next
+    // high-fanout signal to surface after the FSM was capped (12 of 20
+    // worst paths at -0.159 ns at 300 MHz before this attribute).
+    (* MAX_FANOUT = 128 *) logic [$clog2(WIDTH+1)-1:0]  bit_ctr;   // current SAR bit (counts down)
     logic [$clog2(KMAX)-1:0]     k_ctr;     // current term (0..k_len-1)
-    logic [31:0]                 cyc_ctr;   // cycles within the current window
+    logic [16:0]                 cyc_ctr;   // cycles within the current window
+                                            // 17 bits covers STREAM_LEN_RESIDUE up to 131071
+                                            // (was 32 bits; reduced to shorten the
+                                            //  carry chain in the FSM transition compare)
+
+    // Pre-registered comparison targets for the FSM transition conditions.
+    // The original tests were "cyc_ctr + 1 == SAR_BIT_LEN" and
+    // "cyc_ctr + 1 == res_per_k", both 32-bit add+compare cascades that
+    // failed timing at 300 MHz (5 CARRY8 chain + 2 LUT6). Pre-computing
+    // TARGET-1 outside the FSM hot path, and comparing cyc_ctr to it as a
+    // narrow 17-bit equality, collapses the compare to a few LUT6 levels.
+    localparam logic [16:0] SAR_BIT_LEN_M1 = SAR_BIT_LEN[16:0] - 17'd1;
+    logic       [16:0]      res_per_k_m1;
 
     // Per-term residue window length (split STREAM_LEN_RESIDUE across K terms).
     // For K=9 and STREAM_LEN_RESIDUE=65536: ~7281 cycles per term.
@@ -193,7 +223,7 @@ module stoch_gemm_top_hybrid #(
 
                 S_SAR_TERM_RUN: begin
                     cyc_ctr <= cyc_ctr + 1'b1;
-                    if (cyc_ctr + 1'b1 == SAR_BIT_LEN[31:0]) begin
+                    if (cyc_ctr == SAR_BIT_LEN_M1) begin
                         // Finished window for this term.
                         if (k_ctr + 1'b1 == k_len) begin
                             // Last term -- commit the SAR bit.
@@ -224,7 +254,7 @@ module stoch_gemm_top_hybrid #(
 
                 S_RES_TERM_RUN: begin
                     cyc_ctr <= cyc_ctr + 1'b1;
-                    if (cyc_ctr + 1'b1 == res_per_k) begin
+                    if (cyc_ctr == res_per_k_m1) begin
                         if (k_ctr + 1'b1 == k_len) begin
                             // All K terms run for the residue stage. Finalise.
                             state <= S_FINALISE;
@@ -248,6 +278,19 @@ module stoch_gemm_top_hybrid #(
 
             endcase
         end
+    end
+
+    // --------------------------------------------------------------------
+    // Pre-register res_per_k - 1 so the FSM compare is a simple equality
+    // against a register, not an inline 32-bit add+compare. res_per_k only
+    // changes when software writes it via AXI-Lite before core_start, so
+    // this register is just tracking a slow-moving input.
+    // --------------------------------------------------------------------
+    always_ff @(posedge clk) begin
+        if (!rst_n)
+            res_per_k_m1 <= '0;
+        else
+            res_per_k_m1 <= res_per_k[16:0] - 17'd1;
     end
 
 endmodule
