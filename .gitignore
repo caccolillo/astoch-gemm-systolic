@@ -3,3 +3,9 @@
 *.jou
 *.xsa
 *.rpt
+*/gemm_linux/*
+*/s2b_all/*
+*.Xil*
+*project_1*
+*stoch_imgtest*
+*gemm_hybrid_axi*
